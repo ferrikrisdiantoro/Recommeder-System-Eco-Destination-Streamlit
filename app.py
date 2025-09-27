@@ -8,6 +8,13 @@ from utils import seed_places_if_empty, hash_password, check_password, place_to_
 from recommender import RecommenderService
 import pandas as pd
 
+# ========= [RAG ADDON] =========
+# Tambahan import untuk RAG Streamlit
+from rag.config import RAGSettings
+from rag.index import RagIndex
+from rag.ui import render_chatbot   # UI chat popup ala modal
+# ===============================
+
 st.set_page_config(page_title="EcoTourism Recsys (Streamlit)", page_icon="🌿", layout="wide")
 
 # Bootstrap DB
@@ -15,7 +22,7 @@ Base.metadata.create_all(bind=engine)
 with SessionLocal() as sess:
     seed_places_if_empty(sess)
 
-# Load recommender artefacts
+# Load recommender artefak
 BASE_DIR = os.getcwd()
 cbf_dir = os.path.join(BASE_DIR, "models", "cbf")
 cf_dir  = os.path.join(BASE_DIR, "models", "cf")
@@ -29,6 +36,22 @@ try:
 except Exception as e:
     st.sidebar.error(f"Gagal load artefak: {e}")
     RECS = None
+
+# ======== [RAG ADDON] init (cached) ========
+@st.cache_resource(show_spinner=False)
+def _init_rag():
+    settings = RAGSettings(
+        google_api_key=os.environ.get("GOOGLE_API_KEY", "AIzaSyA7J02YavJnOQVehsUUJT47svizCdVqLp4"),
+        chroma_db_path=os.environ.get("CHROMA_DB_PATH", "./chroma_db"),
+        llama_cloud_api_key=os.environ.get("LLAMA_CLOUD_API_KEY", ""),
+        embedding_model=os.environ.get("EMBED_MODEL", "text-embedding-004"),
+        chat_model=os.environ.get("CHAT_MODEL", "gemini-1.5-pro"),
+    )
+    index = RagIndex(settings)
+    return settings, index
+
+RAG_SETTINGS, RAG_INDEX = _init_rag()
+# ===========================================
 
 # Session utils
 def get_sess_user():
@@ -49,13 +72,12 @@ with st.sidebar:
         with st.expander("Login"):
             email = st.text_input("Email", key="login_email")
             pw = st.text_input("Password", type="password", key="login_pw")
-            if st.button("Masuk", use_container_width=True):
+            if st.button("Masuk", width='stretch'):
                 with SessionLocal() as sess:
                     row = sess.scalar(select(User).where(User.email == (email or "").strip().lower()))
                     if not row:
                         st.error("Email tidak ditemukan")
                     else:
-                        # FIX: jangan encode lagi; serahkan ke check_password yang sudah robust
                         if not check_password(pw or "", row.password_hash):
                             st.error("Password salah")
                         else:
@@ -65,7 +87,7 @@ with st.sidebar:
             name_r = st.text_input("Nama", key="reg_name")
             email_r= st.text_input("Email", key="reg_email")
             pw_r   = st.text_input("Password", type="password", key="reg_pw")
-            if st.button("Daftar", use_container_width=True):
+            if st.button("Daftar", width='stretch'):
                 if not name_r or not email_r or not pw_r:
                     st.error("Lengkapi form")
                 else:
@@ -74,7 +96,6 @@ with st.sidebar:
                         if exist:
                             st.error("Email sudah terdaftar")
                         else:
-                            # FIX: simpan bytes langsung (kompatibel dengan kolom BYTEA/LargeBinary)
                             hashed = hash_password(pw_r)
                             u = User(name=name_r.strip(),
                                      email=email_r.strip().lower(),
@@ -83,7 +104,7 @@ with st.sidebar:
                             st.success("Register sukses. Silakan login.")
     else:
         st.success(f"Hi, {u['name']}")
-        if st.button("Logout", use_container_width=True):
+        if st.button("Logout", width='stretch'):
             logout_user()
             st.rerun()
 
@@ -104,7 +125,7 @@ with tab_anon:
                 if i + j < len(df):
                     r = df.iloc[i+j]
                     with col:
-                        st.image(r.get("image",""), use_container_width=True)
+                        st.image(r.get("image",""), width='stretch')
                         st.markdown(f"**{r.get('place_name','')}**")
                         st.caption(f"{r.get('city','-')} • {r.get('category','-')}")
                         st.write(f"Harga: **{display_price(r.get('price',''), 0)}**")
@@ -133,7 +154,7 @@ with tab_home:
                     if i + j < len(recdf):
                         r = recdf.iloc[i+j]
                         with col:
-                            st.image(r.get("image",""), use_container_width=True)
+                            st.image(r.get("image",""), width='stretch')
                             st.markdown(f"**{r.get('place_name','')}**")
                             st.caption(f"{r.get('city','-')} • {r.get('category','-')}")
                             st.write(f"Harga: **{display_price(r.get('price',''), 0)}**")
@@ -163,7 +184,7 @@ with tab_places:
             cols = st.columns([1,2])
             with cols[0]:
                 if p.image:
-                    st.image(p.image, use_container_width=True)
+                    st.image(p.image, width='stretch')
             with cols[1]:
                 st.markdown(f"### {p.place_name}")
                 st.caption(f"{p.city or '-'} • {p.category or '-'}")
@@ -181,7 +202,7 @@ with tab_places:
                 u = get_sess_user()
                 if u:
                     # Bookmark
-                    if st.button(f"🔖 Bookmark {p.id}", key=f"bm_{p.id}", use_container_width=False):
+                    if st.button(f"🔖 Bookmark {p.id}", key=f"bm_{p.id}", width='content'):
                         with SessionLocal() as sess:
                             if not sess.query(Bookmark).filter_by(user_id=u["id"], place_id=p.id).first():
                                 sess.add(Bookmark(user_id=u["id"], place_id=p.id)); sess.commit()
@@ -246,6 +267,10 @@ if st.session_state.get("onboarding"):
                     for pid in sel:
                         r = sess.query(Rating).filter_by(user_id=u["id"], place_id=int(pid)).first()
                         if r: r.rating = 5.0
-                        else: sess.add(Rating(user_id=u["id"], place_id=int(pid), rating=5.0))
+                        else: sess.add(Rating(user_id=u["id"], place_id=int(pid), rating=5.0))  # type: ignore
                     sess.commit()
                 st.success("Preferensi tersimpan. Buka tab Home (AI) untuk melihat rekomendasi.")
+
+# ========= [RAG ADDON] Floating Chatbot =========
+render_chatbot(settings=RAG_SETTINGS, index=RAG_INDEX)
+# ================================================
