@@ -1,4 +1,4 @@
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any
 import os
 
 # Optional: LlamaParse untuk PDF
@@ -33,36 +33,56 @@ def _read_pdf_basic(path: str) -> str:
         return ""
 
 
-def _compose_csv_text(path: str, max_rows: int | None = None) -> str:
-    """
-    Baca CSV → jadikan ringkasan baris-per-baris agar mudah diretrieval.
-    Prioritaskan kolom umum; jika kolom tidak ada, fallback ke semua kolom.
-    """
+def _to_str(x) -> str:
+    try:
+        s = str(x)
+        return "" if s.lower() == "nan" else s
+    except Exception:
+        return ""
+
+
+def _csv_rows_as_docs(path: str) -> List[Dict[str, Any]]:
+    """Setiap baris CSV menjadi satu dokumen ATOMIK (tanpa chunking) agar metadata per-baris ikut ke index."""
     if pd is None:
-        # fallback: baca mentah
+        # fallback: baca mentah jika pandas tidak ada
         try:
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                return f.read()
+                raw = f.read()
+            base = os.path.basename(path)
+            return [{
+                "source": base,
+                "text": raw,
+                "page": 0,
+                "meta": {},
+                "is_atomic": False,   # akan di-chunk biasa
+            }]
         except Exception:
-            return ""
+            return []
 
     try:
         df = pd.read_csv(path)
     except Exception:
+        # fallback: teks mentah
         try:
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                return f.read()
+                raw = f.read()
+            base = os.path.basename(path)
+            return [{
+                "source": base,
+                "text": raw,
+                "page": 0,
+                "meta": {},
+                "is_atomic": False,
+            }]
         except Exception:
-            return ""
+            return []
 
     if df.empty:
-        return ""
+        return []
 
-    # batas baris bila diperlukan
-    if isinstance(max_rows, int) and max_rows > 0:
-        df = df.head(max_rows)
+    base = os.path.basename(path)
 
-    # Kolom yang sering ada di dataset ecotourism kita
+    # kolom umum (kalau ada)
     preferred_cols = [
         "id", "place_id", "place_name", "place_description",
         "category", "city", "address",
@@ -70,42 +90,56 @@ def _compose_csv_text(path: str, max_rows: int | None = None) -> str:
         "rating", "rating_avg",
         "image", "map_url",
     ]
+    used_cols = [c for c in preferred_cols if c in df.columns]
+    if not used_cols:
+        # pakai subset kolom agar ringkas
+        used_cols = df.columns.tolist()[:10]
 
-    # Tentukan kolom yang akan dipakai
-    cols_present = [c for c in preferred_cols if c in df.columns]
-    if not cols_present:
-        # fallback: jika tidak ada kolom preferensi, pakai sampel kolom (maks 8)
-        cols_present = df.columns.tolist()[:8]
-
-    lines = []
-    for _, row in df.iterrows():
+    docs: List[Dict[str, Any]] = []
+    for i, row in df.iterrows():
+        meta: Dict[str, Any] = {}
         parts = []
-        for c in cols_present:
-            val = row.get(c, "")
-            # stringify aman
-            try:
-                sval = str(val)
-            except Exception:
-                sval = ""
-            if sval and sval.strip() and sval.lower() != "nan":
-                parts.append(f"{c}: {sval}")
-        if parts:
-            lines.append(" | ".join(parts))
+        for c in used_cols:
+            val = _to_str(row.get(c, ""))
+            if val:
+                parts.append(f"{c}: {val}")
+                # masukkan juga sebagai metadata terstruktur
+                # NB: metadata harus Bool|Int|Float|Str untuk Chroma Rust → convert ke str/int/float
+                if c in ("price_num", "rating", "rating_avg"):
+                    try:
+                        meta[c] = float(val)
+                    except Exception:
+                        meta[c] = _to_str(val)
+                else:
+                    meta[c] = _to_str(val)
 
-    # Tambahkan header kecil
-    header = f"[CSV] {os.path.basename(path)} — {len(df)} baris, kolom dipakai: {', '.join(cols_present)}"
-    body = "\n".join(lines)
-    return header + "\n" + body if body else header
+        # teks ringkas baris
+        text = " | ".join(parts) if parts else ""
+
+        # page = nomor baris (1-based) agar sitasi berguna
+        docs.append({
+            "source": base,
+            "text": text,
+            "page": int(i) + 1,
+            "meta": meta,
+            "is_atomic": True,   # jangan di-chunk lagi
+        })
+
+    return docs
 
 
-def parse_files(paths: List[str], llama_api_key: str = "") -> List[Tuple[str, str]]:
+def parse_files(paths: List[str], llama_api_key: str = "") -> List[Dict[str, Any]]:
     """
-    Returns list of (source, text)
-    - PDF: LlamaParse jika ada API key; fallback PyPDF2.
-    - CSV: pandas → ringkasan baris per baris (lebih ramah retrieval).
-    - TXT/MD/LAINNYA: baca sebagai teks biasa.
+    Returns list of dict:
+      {
+        "source": <basename>,
+        "text": <str>,
+        "page": <int>,
+        "meta": <dict>,
+        "is_atomic": <bool>   # True => dipakai apa adanya, False => akan di-chunk
+      }
     """
-    docs: List[Tuple[str, str]] = []
+    out: List[Dict[str, Any]] = []
     use_llama = bool(llama_api_key and LlamaParse is not None)
     parser = None
     if use_llama:
@@ -114,10 +148,15 @@ def parse_files(paths: List[str], llama_api_key: str = "") -> List[Tuple[str, st
     for p in paths:
         ext = os.path.splitext(p)[1].lower()
         base = os.path.basename(p)
-        text = ""
+
+        # CSV → per-baris sebagai dokumen atomik
+        if ext == ".csv":
+            out.extend(_csv_rows_as_docs(p))
+            continue
 
         # PDF
         if ext == ".pdf":
+            text = ""
             if use_llama:
                 try:
                     result = parser.load_data(p)
@@ -126,20 +165,29 @@ def parse_files(paths: List[str], llama_api_key: str = "") -> List[Tuple[str, st
                     text = ""
             if not text:
                 text = _read_pdf_basic(p)
-
-        # CSV
-        elif ext == ".csv":
-            text = _compose_csv_text(p, max_rows=None)
+            if text.strip():
+                out.append({
+                    "source": base,
+                    "text": text,
+                    "page": 0,
+                    "meta": {},
+                    "is_atomic": False,  # akan di-chunk
+                })
+            continue
 
         # TXT/MD/LAINNYA
-        else:
-            try:
-                with open(p, "r", encoding="utf-8", errors="ignore") as f:
-                    text = f.read()
-            except Exception:
-                text = ""
+        try:
+            with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                raw = f.read()
+        except Exception:
+            raw = ""
+        if raw.strip():
+            out.append({
+                "source": base,
+                "text": raw,
+                "page": 0,
+                "meta": {},
+                "is_atomic": False,
+            })
 
-        if text.strip():
-            docs.append((base, text))
-
-    return docs
+    return out

@@ -1,122 +1,91 @@
-# rag/ui.py — Chatbot panel di MAIN PAGE (tanpa popup/JS)
-
-import os
+# rag/ui.py — FULL REPLACEMENT
+from typing import List, Dict
 import streamlit as st
-from typing import List, Dict, Any
 from .config import RAGSettings
 from .index import RagIndex
 from .chain import ask
 
+# Sedikit CSS untuk chips sitasi
+CHAT_CSS = """
+<style>
+.badge { font-size:12px; padding:2px 8px; border:1px solid #33415566; border-radius:9999px; display:inline-block; }
+.cites { margin-top:6px; display:flex; gap:6px; flex-wrap: wrap; }
+.cite { font-size:12px; padding:2px 8px; border:1px solid #33415566; border-radius:999px; }
+.toolbar { display:flex; gap:8px; align-items:center; margin-bottom:8px; }
+</style>
+"""
 
-def _ensure_state():
+def _history_for_chain() -> List[Dict[str, str]]:
+    # Ambil seluruh riwayat (user+assistant) untuk konteks follow-up
+    return st.session_state.get("rag_msgs", [])
+
+def render_chatbot_panel(settings: RAGSettings, index: RagIndex):
+    st.markdown(CHAT_CSS, unsafe_allow_html=True)
+    st.subheader("🤖 Chatbot AI (RAG)")
+
     if "rag_msgs" not in st.session_state:
         st.session_state["rag_msgs"] = [
-            {"role": "assistant", "content": "Halo! Unggah dokumen (opsional), lalu ajukan pertanyaan. Aku akan jawab berbasis konteks dan sertakan sitasi."}
+            {"role": "assistant", "content": "Halo! Silakan ajukan pertanyaan. Aku akan jawab berdasarkan dokumen yang sudah diindeks."}
         ]
     if "rag_busy" not in st.session_state:
         st.session_state["rag_busy"] = False
-    if "rag_temp" not in st.session_state:
-        st.session_state["rag_temp"] = 0.3
 
+    # Toolbar: clear + info index
+    with st.container():
+        c1, c2 = st.columns([1, 6])
+        with c1:
+            if st.button("🧹 Clear"):
+                st.session_state["rag_msgs"] = [
+                    {"role": "assistant", "content": "Riwayat dibersihkan. Tanyakan sesuatu terkait dokumen yang sudah diindeks ya!"}
+                ]
+                st.rerun()
+        with c2:
+            try:
+                st.markdown(f'<span class="badge">Index: {index.count()} vektor</span>', unsafe_allow_html=True)
+            except Exception:
+                st.markdown(f'<span class="badge">Index: n/a</span>', unsafe_allow_html=True)
 
-def _ingest_block(index: RagIndex):
-    with st.expander("📥 Indeks Dokumen", expanded=False):
-        files = st.file_uploader(
-            "Unggah PDF/TXT/CSV/DOCX (multi-file didukung)",
-            type=None,
-            accept_multiple_files=True,
-            help="PDF: LlamaParse (opsional) atau PyPDF2; CSV: diringkas per baris; TXT/DOCX: baca mentah."
-        )
-        tag = st.text_input("Tag (opsional, untuk filter metadata)", value="", key="rag_tag_panel")
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("Indeks", width='stretch', disabled=st.session_state["rag_busy"], key="rag_btn_ingest_panel"):
-                if not files:
-                    st.info("Pilih file terlebih dahulu.")
-                else:
-                    st.session_state["rag_busy"] = True
-                    try:
-                        tmpdir = os.path.join(".rag_tmp")
-                        os.makedirs(tmpdir, exist_ok=True)
-                        paths = []
-                        for f in files:
-                            p = os.path.join(tmpdir, f.name)
-                            with open(p, "wb") as w:
-                                w.write(f.read())
-                            paths.append(p)
-                        n = index.ingest_paths(paths, tags=tag)
-                        st.success(f"Berhasil mengindeks {n} chunk.")
-                    except Exception as e:
-                        st.error(f"Gagal ingest: {e}")
-                    finally:
-                        st.session_state["rag_busy"] = False
-        with col2:
-            if st.button("Bersihkan Riwayat Chat", width='stretch', key="rag_btn_clear_panel"):
-                st.session_state["rag_msgs"] = []
-
-
-def _render_history_markdown():
-    # Alternatif tampilan markdown (stabil untuk semua versi)
+    # ===== Messages (pakai chat_message agar alignment & markdown bagus)
     for m in st.session_state["rag_msgs"]:
         role = m.get("role", "assistant")
-        txt = m.get("content", "")
+        content = m.get("content", "")
         cites = m.get("citations", [])
-        if role == "user":
-            st.markdown(f"**Anda:** {txt}")
-        else:
-            st.markdown(f"**AI:** {txt}")
-            if cites:
-                chips = []
-                for c in cites:
-                    src = c.get("source") or "source"
-                    pg = c.get("page")
-                    chips.append(f"`{src}{', p.'+str(pg) if pg else ''}`")
-                st.caption("Sumber: " + "  ".join(chips))
-
-
-def render_chatbot_panel(settings: RAGSettings, index: RagIndex):
-    """
-    Tampilkan chatbot RAG di MAIN PAGE (bukan sidebar). 
-    Dipanggil dari app.py saat tombol di sidebar di-klik.
-    """
-    _ensure_state()
-
-    st.header("🤖 AI Chatbot (RAG)")
-    _ingest_block(index)
-
-    st.divider()
-    # Tampilkan riwayat
-    _render_history_markdown()
-
-    st.divider()
-    # Pengaturan ringan
-    with st.expander("⚙️ Pengaturan", expanded=False):
-        st.session_state["rag_temp"] = st.slider(
-            "Suhu (temperature)",
-            0.0, 1.0, float(st.session_state.get("rag_temp", 0.3)), 0.1,
-            help="Lebih tinggi = jawaban lebih kreatif (biasanya 0.2–0.4 untuk RAG)."
-        )
-
-    # Input chat di main page
-    prompt = st.text_input("Tulis pertanyaan…", key="rag_input_main")
-    if st.button("Kirim", width='content', disabled=st.session_state["rag_busy"], key="rag_btn_send_main"):
-        qq = (prompt or "").strip()
-        if not qq:
-            st.info("Pertanyaan masih kosong.")
-        else:
-            st.session_state["rag_msgs"].append({"role": "user", "content": qq})
-            st.session_state["rag_busy"] = True
-            try:
-                ans, cites = ask(
-                    index=index,
-                    settings=settings,
-                    query=qq,
-                    k=6,
-                    temperature=float(st.session_state["rag_temp"]),
+        with st.chat_message("user" if role == "user" else "assistant",
+                             avatar="🧑" if role == "user" else "🤖"):
+            # Render markdown murni → bullet/list rapi
+            st.markdown(content)
+            # Chips sitasi (sudah dide-dup di chain)
+            if cites and role != "user":
+                chips = " ".join(
+                    [f'<span class="cite">{(c.get("source") or "src")}{", p."+str(c.get("page")) if c.get("page") else ""}</span>'
+                     for c in cites]
                 )
-                st.session_state["rag_msgs"].append({"role": "assistant", "content": ans, "citations": cites})
-            except Exception as e:
-                st.session_state["rag_msgs"].append({"role": "assistant", "content": f"(error) {e}"})
-            finally:
-                st.session_state["rag_busy"] = False
-                st.rerun()
+                st.markdown(f'<div class="cites">{chips}</div>', unsafe_allow_html=True)
+
+    # ===== Input (sticky di bawah)
+    prompt = st.chat_input("Tulis pertanyaan…")
+    if prompt:
+        st.session_state["rag_msgs"].append({"role": "user", "content": prompt})
+        st.session_state["rag_busy"] = True
+        try:
+            ans, cites = ask(
+                index=index,
+                settings=settings,
+                query=prompt,
+                k=6,
+                history=_history_for_chain()  # kirim riwayat → follow-up paham
+            )
+            st.session_state["rag_msgs"].append(
+                {"role": "assistant", "content": ans, "citations": cites}
+            )
+        except Exception as e:
+            st.session_state["rag_msgs"].append(
+                {"role": "assistant", "content": f"(error) {e}"}
+            )
+        finally:
+            st.session_state["rag_busy"] = False
+            st.rerun()
+
+# Backward compatibility untuk app.py lama
+def render_chatbot(settings: RAGSettings, index: RagIndex):
+    return render_chatbot_panel(settings, index)

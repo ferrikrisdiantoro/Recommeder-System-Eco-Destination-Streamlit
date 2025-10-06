@@ -8,12 +8,6 @@ from .chunk import chunk_text
 from .config import RAGSettings
 
 def _sanitize_meta(m: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Chroma (Rust bindings) hanya terima Bool | Int | Float | Str | SparseVector.
-    - Buang key dengan None
-    - 'page' -> int
-    - 'source'/'tags' -> str
-    """
     clean: Dict[str, Any] = {}
     for k, v in (m or {}).items():
         if v is None:
@@ -30,12 +24,6 @@ def _sanitize_meta(m: Dict[str, Any]) -> Dict[str, Any]:
     return clean
 
 def _normalize_where(where: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """
-    Chroma >=0.5 tidak menerima where={} (kosong), dan prefer operator ($and/$or).
-    - Jika None/{} -> return None (jangan kirim 'where' ke query)
-    - Jika sudah pakai operator ($and/$or/...) -> biarkan
-    - Jika dict sederhana {k: v} -> ubah ke {"$and":[{k: {"$eq": v}}, ...]}
-    """
     if not where:
         return None
     if any(str(k).startswith("$") for k in where.keys()):
@@ -56,35 +44,70 @@ class RagIndex:
         self.collection = self.client.get_or_create_collection("rag_docs")
         self.embedder = GeminiEmbedder(api_key=self.settings.google_api_key, model=self.settings.embedding_model)
 
+    # -------- Utilities --------
+    def count(self) -> int:
+        try:
+            return int(self.collection.count())
+        except Exception:
+            got = self.collection.get(limit=1)
+            return len(got.get("ids", []))
+
+    def has_source(self, path_or_basename: str) -> bool:
+        base = os.path.basename(path_or_basename)
+        try:
+            res = self.collection.get(where={"source": {"$eq": base}}, limit=1)
+            ids = res.get("ids", [])
+            if isinstance(ids, list) and ids:
+                first = ids[0]
+                if isinstance(first, list):
+                    return len(first) > 0
+                return True
+            return False
+        except Exception:
+            return False
+
     # -------- Ingestion --------
     def ingest_paths(self, paths: List[str], tags: Optional[str] = "") -> int:
         docs = parse_files(paths, llama_api_key=self.settings.llama_cloud_api_key)
-        all_chunks = []
-        for src, txt in docs:
-            chs = chunk_text(source=src, text=txt, chunk_size=1200, chunk_overlap=200)
-            for c in chs:
-                c["tags"] = tags or ""   # str, bukan None
-            all_chunks.extend(chs)
 
-        if not all_chunks:
+        all_ids: List[str] = []
+        all_texts: List[str] = []
+        all_metas: List[Dict[str, Any]] = []
+
+        for doc in docs:
+            source = doc.get("source", "")
+            base_page = int(doc.get("page", 0))
+            base_meta = doc.get("meta", {}) or {}
+            is_atomic = bool(doc.get("is_atomic", False))
+
+            if is_atomic:
+                # satu baris CSV = satu chunk
+                cid = f"{source}::row{base_page}"
+                all_ids.append(cid)
+                all_texts.append(doc.get("text", ""))
+                md = {"source": source, "page": base_page, "tags": tags or ""}
+                md.update(base_meta)
+                all_metas.append(_sanitize_meta(md))
+            else:
+                # dokumen panjang → chunking
+                chs = chunk_text(source=source, text=doc.get("text", ""), chunk_size=1200, chunk_overlap=200)
+                for c in chs:
+                    c["tags"] = tags or ""
+                    # gunakan page asal (0) untuk pdf/txt, boleh juga pakai nomor chunk
+                    page_val = c.get("page", base_page)
+                    cid = c["id"]
+                    all_ids.append(cid)
+                    all_texts.append(c["text"])
+                    md = {"source": c["source"], "page": page_val, "tags": c["tags"]}
+                    md.update(base_meta)  # meta umum dari dokumen asal
+                    all_metas.append(_sanitize_meta(md))
+
+        if not all_ids:
             return 0
 
-        ids = [c["id"] for c in all_chunks]
-        texts = [c["text"] for c in all_chunks]
-
-        # Bersihkan metadata dari nilai None
-        metas = [_sanitize_meta({
-            "source": c.get("source", ""),
-            "page": c.get("page", 0),
-            "tags": c.get("tags", "")
-        }) for c in all_chunks]
-
-        # Embeddings
-        embs = self.embedder.embed(texts)
-
-        # Tambahkan ke Chroma
-        self.collection.add(ids=ids, documents=texts, embeddings=embs, metadatas=metas)
-        return len(all_chunks)
+        embs = self.embedder.embed(all_texts)
+        self.collection.add(ids=all_ids, documents=all_texts, embeddings=embs, metadatas=all_metas)
+        return len(all_ids)
 
     # -------- Query --------
     def retrieve(self, query: str, k: int = 6, where: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
@@ -93,7 +116,7 @@ class RagIndex:
 
         norm_where = _normalize_where(where)
         if norm_where is not None:
-            qkwargs["where"] = norm_where  # hanya kirim kalau valid
+            qkwargs["where"] = norm_where
 
         res = self.collection.query(**qkwargs)
 

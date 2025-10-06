@@ -4,14 +4,13 @@ from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 from db import Base, engine, SessionLocal
 from models import User, Place, Rating, Comment, Bookmark
-from utils import seed_places_if_empty, hash_password, check_password, place_to_dict, display_price
+from utils import seed_places_if_empty, hash_password, check_password, display_price
 from recommender import RecommenderService
-import pandas as pd
 
 # ========= [RAG ADDON] =========
 from rag.config import RAGSettings
 from rag.index import RagIndex
-from rag.ui import render_chatbot_panel   # <<— panel di main page
+from rag.ui import render_chatbot_panel   # panel chatbot di main page (dipanggil saat toggle)
 # ===========================================
 
 st.set_page_config(page_title="EcoTourism Recsys (Streamlit)", page_icon="🌿", layout="wide")
@@ -36,9 +35,12 @@ except Exception as e:
     st.sidebar.error(f"Gagal load artefak: {e}")
     RECS = None
 
-# ======== [RAG ADDON] init (cached) ========
-@st.cache_resource(show_spinner=False)
-def _init_rag():
+# ======== [RAG ADDON] init + PRE-INGEST CSV (cached) ========
+DEFAULT_BOOTSTRAP_CSV = "/mnt/d/Projek/Freelancer/cl9_fw - Mentoring build System Recommender (DONE)/streamlit_recsys/models/cbf/places_clean.csv"
+
+@st.cache_resource(show_spinner=True)
+def _init_rag_with_bootstrap():
+    # 1) Settings
     try:
         settings = RAGSettings.from_env()
     except Exception:
@@ -49,16 +51,35 @@ def _init_rag():
             embedding_model=os.environ.get("EMBED_MODEL", "text-embedding-004"),
             chat_model=os.environ.get("CHAT_MODEL", "gemini-1.5-pro"),
         )
-    try:
-        idx = RagIndex(settings)
-        return settings, idx, None
-    except Exception as e:
-        return settings, None, str(e)
 
-RAG_SETTINGS, RAG_INDEX, RAG_ERR = _init_rag()
+    # 2) Index
+    idx = RagIndex(settings)
+
+    # 3) Pre-ingest file CSV “di belakang” (sekali saja berkat cache_resource)
+    bootstrap_csv = os.environ.get("RAG_BOOTSTRAP_CSV", DEFAULT_BOOTSTRAP_CSV)
+    bootstrap_csv = bootstrap_csv.strip('"').strip("'") if bootstrap_csv else ""
+    ingest_report = {"path": bootstrap_csv, "skipped": False, "ingested": 0, "reason": ""}
+
+    if bootstrap_csv and os.path.exists(bootstrap_csv):
+        base = os.path.basename(bootstrap_csv)
+        if idx.has_source(base):
+            ingest_report["skipped"] = True
+            ingest_report["reason"] = "sudah terindeks"
+        else:
+            try:
+                n = idx.ingest_paths([bootstrap_csv], tags="bootstrap:places_clean")
+                ingest_report["ingested"] = int(n)
+            except Exception as e:
+                ingest_report["reason"] = f"gagal ingest: {e}"
+    else:
+        ingest_report["reason"] = "file tidak ditemukan"
+
+    return settings, idx, ingest_report
+
+RAG_SETTINGS, RAG_INDEX, BOOTSTRAP_INFO = _init_rag_with_bootstrap()
 # ===========================================
 
-# Session utils
+# ====== Session utils ======
 def get_sess_user():
     return st.session_state.get("user")
 
@@ -70,9 +91,9 @@ def logout_user():
 
 # Flag tampilan chatbot di main page
 if "show_chatbot" not in st.session_state:
-    st.session_state["show_chatbot"] = False
+    st.session_state["show_chatbot"] = True  # langsung tampil chatbot saat start
 
-# Sidebar (Auth + tombol toggle chatbot)
+# Sidebar (Auth + toggle tombol)
 with st.sidebar:
     st.markdown("## 🌿 EcoTourism Recsys")
     u = get_sess_user()
@@ -81,7 +102,7 @@ with st.sidebar:
         with st.expander("Login"):
             email = st.text_input("Email", key="login_email")
             pw = st.text_input("Password", type="password", key="login_pw")
-            if st.button("Masuk", width='stretch'):
+            if st.button("Masuk", use_container_width=True):
                 with SessionLocal() as sess:
                     row = sess.scalar(select(User).where(User.email == (email or "").strip().lower()))
                     if not row:
@@ -96,7 +117,7 @@ with st.sidebar:
             name_r = st.text_input("Nama", key="reg_name")
             email_r= st.text_input("Email", key="reg_email")
             pw_r   = st.text_input("Password", type="password", key="reg_pw")
-            if st.button("Daftar", width='stretch'):
+            if st.button("Daftar", use_container_width=True):
                 if not name_r or not email_r or not pw_r:
                     st.error("Lengkapi form")
                 else:
@@ -105,50 +126,46 @@ with st.sidebar:
                         if exist:
                             st.error("Email sudah terdaftar")
                         else:
+                            from models import User as U
                             hashed = hash_password(pw_r)
-                            u = User(name=name_r.strip(),
-                                     email=email_r.strip().lower(),
-                                     password_hash=hashed)
+                            u = U(name=name_r.strip(), email=email_r.strip().lower(), password_hash=hashed)
                             sess.add(u); sess.commit()
                             st.success("Register sukses. Silakan login.")
     else:
         st.success(f"Hi, {u['name']}")
-        if st.button("Logout", width='stretch'):
+        if st.button("Logout", use_container_width=True):
             logout_user()
             st.rerun()
 
     st.divider()
-    # Tombol toggle Chatbot AI
+    # Informasi bootstrap (sekali tampil; berguna saat debugging)
+    with st.expander("ℹ️ Status Index RAG", expanded=False):
+        st.write(f"Chroma DB Path: `{RAG_SETTINGS.chroma_db_path}`")
+        st.write(f"Total vektor: `{RAG_INDEX.count()}`")
+        st.write("Bootstrap CSV:")
+        st.json(BOOTSTRAP_INFO)
+
+    # Toggle Chatbot / Rekomendasi
     if not st.session_state["show_chatbot"]:
-        enable = st.button("🤖 Buka Chatbot AI", width='stretch')
-        if enable:
+        if st.button("🤖 Buka Chatbot AI", use_container_width=True):
             st.session_state["show_chatbot"] = True
             st.rerun()
     else:
-        disable = st.button("⬅️ Kembali ke Rekomendasi", width='stretch')
-        if disable:
+        if st.button("⬅️ Kembali ke Rekomendasi", use_container_width=True):
             st.session_state["show_chatbot"] = False
             st.rerun()
 
-    # Info error RAG (bila index gagal inisialisasi)
-    if RAG_INDEX is None:
-        st.warning("Chatbot RAG tidak aktif.\n\n"
-                   "Set **GOOGLE_API_KEY** (dan opsional **LLAMA_CLOUD_API_KEY**) di environment/`.env` lalu refresh.\n\n"
-                   f"Detail: {RAG_ERR}")
-
 st.title("🏞️ EcoTourism Recsys — Streamlit")
 
-# ===== Main Area: tampilkan Chatbot ATAU Tabs Rekomendasi =====
+# ===== Main Area: Chatbot ATAU Tabs =====
 if st.session_state["show_chatbot"]:
-    if RAG_INDEX is None:
-        st.info("RAG belum siap. Periksa konfigurasi di sidebar.")
-    else:
-        render_chatbot_panel(settings=RAG_SETTINGS, index=RAG_INDEX)
-
+    render_chatbot_panel(settings=RAG_SETTINGS, index=RAG_INDEX)
 else:
+    # === Tabs Rekomendasi (seperti sebelumnya) ===
+    from models import User as U
     tab_anon, tab_home, tab_places = st.tabs(["Populer", "Home (AI)", "Cari Tempat"])
 
-    # Tab Populer (anonymous)
+    # Tab Populer
     with tab_anon:
         st.subheader("Rekomendasi Populer")
         if RECS is None:
@@ -161,13 +178,13 @@ else:
                     if i + j < len(df):
                         r = df.iloc[i+j]
                         with col:
-                            st.image(r.get("image",""), width='stretch')
+                            st.image(r.get("image",""), use_container_width=True)
                             st.markdown(f"**{r.get('place_name','')}**")
                             st.caption(f"{r.get('city','-')} • {r.get('category','-')}")
                             st.write(f"Harga: **{display_price(r.get('price',''), 0)}**")
                             st.write(f"Rating: **{float(r.get('rating',0.0)):.1f}**")
 
-    # Tab Home (AI) — personalized
+    # Tab Home (AI)
     with tab_home:
         st.subheader("Rekomendasi AI (Hybrid)")
         u = get_sess_user()
@@ -176,6 +193,7 @@ else:
         elif RECS is None:
             st.warning("Artefak belum tersedia.")
         else:
+            from models import Rating
             with SessionLocal() as sess:
                 rows = sess.execute(select(Rating).where(Rating.user_id == u["id"])).scalars().all()
                 user_ratings = {int(r.place_id): float(r.rating) for r in rows}
@@ -190,15 +208,16 @@ else:
                         if i + j < len(recdf):
                             r = recdf.iloc[i+j]
                             with col:
-                                st.image(r.get("image",""), width='stretch')
+                                st.image(r.get("image",""), use_container_width=True)
                                 st.markdown(f"**{r.get('place_name','')}**")
                                 st.caption(f"{r.get('city','-')} • {r.get('category','-')}")
                                 st.write(f"Harga: **{display_price(r.get('price',''), 0)}**")
                                 st.write(f"Rating: **{float(r.get('rating',0.0)):.1f}**")
         st.caption("Klik tab 'Cari Tempat' untuk memberi rating dan memicu rekomendasi ulang.")
 
-    # Tab Cari Tempat + Detail inline
+    # Tab Cari Tempat
     with tab_places:
+        from models import Place, Rating, Comment, Bookmark, User as U
         q = st.text_input("Cari nama tempat")
         city = st.text_input("Kota")
         cat = st.text_input("Kategori")
@@ -220,7 +239,7 @@ else:
                 cols = st.columns([1,2])
                 with cols[0]:
                     if p.image:
-                        st.image(p.image, width='stretch')
+                        st.image(p.image, use_container_width=True)
                 with cols[1]:
                     st.markdown(f"### {p.place_name}")
                     st.caption(f"{p.city or '-'} • {p.category or '-'}")
@@ -237,14 +256,12 @@ else:
 
                     u = get_sess_user()
                     if u:
-                        # Bookmark
                         if st.button(f"🔖 Bookmark {p.id}", key=f"bm_{p.id}"):
                             with SessionLocal() as sess:
                                 if not sess.query(Bookmark).filter_by(user_id=u["id"], place_id=p.id).first():
                                     sess.add(Bookmark(user_id=u["id"], place_id=p.id)); sess.commit()
                             st.success("Ditambahkan ke bookmark")
 
-                        # Rating
                         my_r = 0.0
                         with SessionLocal() as sess:
                             r = sess.query(Rating).filter_by(user_id=u["id"], place_id=p.id).first()
@@ -262,7 +279,6 @@ else:
                             st.success("Rating tersimpan. Rekomendasi akan berubah setelah Anda memberi beberapa rating.")
                             st.rerun()
 
-                        # Comments
                         st.markdown("**Komentar**")
                         comment_text = st.text_input(f"Tulis komentar... {p.id}", key=f"c_{p.id}")
                         if st.button(f"Kirim Komentar {p.id}", key=f"send_{p.id}"):
@@ -301,6 +317,7 @@ else:
                 if st.button("Simpan preferensi"):
                     with SessionLocal() as sess:
                         for pid in sel:
+                            from models import Rating
                             r = sess.query(Rating).filter_by(user_id=u["id"], place_id=int(pid)).first()
                             if r: r.rating = 5.0
                             else: sess.add(Rating(user_id=u["id"], place_id=int(pid), rating=5.0))
