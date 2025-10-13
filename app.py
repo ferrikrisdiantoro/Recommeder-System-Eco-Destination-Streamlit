@@ -199,26 +199,126 @@ if st.session_state["show_chatbot"]:
 else:
     tab_anon, tab_home, tab_places = st.tabs(["Populer", "Home (AI)", "Cari Tempat"])
 
-    # -------------------- Tab Populer --------------------
+    # -------------------- Tab Populer (SEKARANG interaktif) --------------------
     with tab_anon:
         st.subheader("Rekomendasi Populer")
         if RECS is None:
             st.warning("Artefak belum tersedia.")
         else:
-            df = RECS.top_rated(k=12)
+            # Pilih jumlah item ditampilkan
+            top_k = st.selectbox("Tampilkan", options=[6, 9, 12, 24, 48], index=2, key="popular_k")
+            df = RECS.top_rated(k=int(top_k))
+            st.caption("Anda dapat memberi rating, komentar, bookmark, melihat deskripsi & peta langsung di sini.")
             for i in range(0, len(df), 3):
                 cols = st.columns(3)
                 for j, col in enumerate(cols):
-                    if i + j < len(df):
-                        r = df.iloc[i+j]
-                        with col:
-                            img = r.get("image","")
-                            if img:
-                                st.image(img, width="stretch")
-                            st.markdown(f"**{r.get('place_name','')}**")
-                            st.caption(f"{r.get('city','-')} • {r.get('category','-')}")
-                            st.write(f"Harga: **{display_price(r.get('price',''), 0)}**")
-                            st.write(f"Rating: **{float(r.get('rating',0.0)):.1f}**")
+                    if i + j >= len(df):
+                        continue
+                    r = df.iloc[i + j]
+                    pid = int(r.get("id", r.get("place_id", -1)))
+                    if pid < 0:
+                        continue
+
+                    # Load entitas lengkap untuk deskripsi/map
+                    with SessionLocal() as sess:
+                        p = sess.get(Place, pid)
+
+                    with col:
+                        with st.container(border=True):
+                            if p and p.image:
+                                st.image(p.image, width="stretch")
+
+                            name = (p.place_name if p else r.get("place_name", "")) or ""
+                            city = (p.city if p else r.get("city", "")) or "-"
+                            cat  = (p.category if p else r.get("category", "")) or "-"
+                            price_text = display_price(p.price_str if p else r.get("price", ""), p.price_num if p else 0.0)
+                            rating_val = float((p.rating_avg if p else r.get("rating", 0.0)) or 0.0)
+
+                            st.markdown(f"### {name}")
+                            st.caption(f"{city} • {cat}")
+                            st.write(f"Harga: **{price_text}**")
+                            st.write(f"Rating rata-rata: **{rating_val:.1f}**")
+
+                            if p and p.map_url:
+                                st.link_button("🌍 Map", p.map_url, width="content")
+
+                            if p and (p.place_description or "").strip():
+                                with st.expander("Detail"):
+                                    st.write(p.place_description)
+
+                            user_logged = get_sess_user()
+                            if user_logged:
+                                # Bookmark
+                                if st.button("🔖 Bookmark", key=f"pop_bm_{pid}", width="content"):
+                                    with SessionLocal() as sess:
+                                        if not sess.query(Bookmark).filter_by(user_id=user_logged["id"], place_id=pid).first():
+                                            sess.add(Bookmark(user_id=user_logged["id"], place_id=pid))
+                                            sess.commit()
+                                    st.success("Ditambahkan ke bookmark")
+
+                                # Rating
+                                with SessionLocal() as sess:
+                                    my_r = 0.0
+                                    rr = sess.query(Rating).filter_by(user_id=user_logged["id"], place_id=pid).first()
+                                    if rr:
+                                        my_r = float(rr.rating)
+
+                                new_rating = st.slider(
+                                    "Beri rating",
+                                    min_value=1, max_value=5,
+                                    value=int(my_r) if my_r else 5,
+                                    key=f"pop_rate_{pid}"
+                                )
+                                if st.button("Simpan Rating", key=f"pop_save_{pid}", width="content"):
+                                    with SessionLocal() as sess:
+                                        rrow = sess.query(Rating).filter_by(user_id=user_logged["id"], place_id=pid).first()
+                                        if rrow:
+                                            rrow.rating = float(new_rating)
+                                        else:
+                                            sess.add(Rating(user_id=user_logged["id"], place_id=pid, rating=float(new_rating)))
+                                        sess.commit()
+                                        # Update place avg
+                                        avg, cnt = sess.query(func.avg(Rating.rating), func.count(Rating.id))\
+                                                       .filter(Rating.place_id == pid).first()
+                                        if p:
+                                            p.rating_avg = float(avg or 0.0)
+                                            sess.commit()
+                                    st.success("Rating tersimpan.")
+                                    st.rerun()
+
+                                # Comments
+                                st.markdown("**Komentar**")
+                                comment_text = st.text_input(
+                                    "Tulis komentar…",
+                                    key=f"pop_c_{pid}",
+                                    label_visibility="collapsed",
+                                    placeholder="Tulis komentar…"
+                                )
+                                if st.button("Kirim Komentar", key=f"pop_send_{pid}", width="content"):
+                                    ct = (comment_text or "").strip()
+                                    if ct:
+                                        with SessionLocal() as sess:
+                                            sess.add(Comment(user_id=user_logged["id"], place_id=pid, text=ct))
+                                            sess.commit()
+                                        st.success("Komentar terkirim")
+                                        st.rerun()
+
+                                # Show recent comments
+                                with SessionLocal() as sess:
+                                    cr = (
+                                        sess.query(Comment, User)
+                                        .join(User, Comment.user_id == User.id)
+                                        .filter(Comment.place_id == pid)
+                                        .order_by(Comment.created_at.desc())
+                                        .all()
+                                    )
+                                if cr:
+                                    for c, user in cr:
+                                        st.write(f"- *{user.name}* • {c.created_at}: {c.text}")
+                                else:
+                                    st.caption("_Belum ada komentar_")
+                            else:
+                                st.info("Login untuk memberi rating, komentar, dan bookmark.")
 
     # ------------- Tab Home (AI) — PAGINATION + Interaktif -------------
     with tab_home:
